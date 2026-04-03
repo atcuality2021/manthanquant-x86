@@ -154,13 +154,42 @@ Both running Qwen3.5-35B-A3B, unique prompts (no cache hits), temperature=0.
 | RTX 6000 + MQ | 500 | 125 | 16.06s | **31.1** |
 | GB10 Baseline | 500 | 127 | 22.73s | 21.9 |
 
-### Concurrent Scaling (both nodes simultaneously)
+### Concurrent User Scaling (RTX 6000 + ManthanQuant)
 
-| Concurrent | RTX 6000 + MQ (agg tok/s) | GB10 (agg tok/s) |
-|-----------|--------------------------|------------------|
-| 1 | 21.7 | 21.7 |
-| 2 | 43.6 | 43.6 |
-| 4 | 69.5 | 69.5 |
+200 tokens per user, unique prompts, ManthanQuant 3-bit compression active.
+
+| Users | Success | Agg tok/s | Per-user tok/s | Wall Time |
+|-------|---------|-----------|----------------|-----------|
+| 1 | 1/1 | 31.4 | **31.4** | 6.3s |
+| 2 | 2/2 | 58.9 | **29.4** | 6.8s |
+| **4** | **4/4** | **115.9** | **28.9** | **6.9s** |
+| 6 | 6/6 | 86.8 | 14.4 | 13.8s |
+| **8** | **8/8** | **116.6** | **14.5** | **13.7s** |
+| 10 | 10/10 | 97.1 | 9.7 | 20.6s |
+| 15 | 15/15 | 109.9 | 7.3 | 27.3s |
+| 20 | 20/20 | 117.6 | 5.8 | 34.0s |
+
+**Sweet spot: 4 users** -- 116 agg tok/s, 28.9 per-user tok/s, 0 errors.
+**Max throughput: 8-20 users** -- 117 agg tok/s, all requests succeed.
+
+### Per-User Token Budget (RTX 6000)
+
+| Users | Per-user tok/s | Time for 100 tok | Time for 500 tok | Time for 1000 tok |
+|-------|----------------|-----------------|-----------------|------------------|
+| 1 | 31.4 | 3.2s | 16s | 32s |
+| 4 | 28.9 | 3.5s | 17s | 35s |
+| 8 | 14.5 | 6.9s | 34s | 69s |
+| 15 | 7.3 | 13.7s | 68s | 137s |
+
+### Cross-Cluster Concurrent Comparison
+
+| Users | RTX 6000 + MQ (agg tok/s) | GB10 + MQ (agg tok/s) | RTX Advantage |
+|-------|--------------------------|----------------------|---------------|
+| 1 | 31.4 | 21.7 | **+45%** |
+| 4 | 115.9 | 61.1 | **+90%** |
+| 8 | 116.6 | 101.3 | **+15%** |
+| 15 | 109.9 | 95.7 | **+15%** |
+| 20 | 117.6 | 88.5 | **+33%** |
 
 ### CUDA Kernel Performance (Phase 2)
 
@@ -173,14 +202,14 @@ Both running Qwen3.5-35B-A3B, unique prompts (no cache hits), temperature=0.
 ### Compression Statistics (live inference)
 
 ```
-[ManthanQuant pid=491422] calls=114600 compressed=458 ratio=5.12x saved=23.03MB
+[ManthanQuant pid=491422] calls=152800 compressed=986 ratio=5.12x saved=49.59MB
 ```
 
-- **114,600** cache write operations intercepted
-- **458** blocks compressed to COLD tier
+- **152,800** cache write operations intercepted
+- **986** blocks compressed to COLD tier
 - **5.12x** compression ratio (matches theoretical Lloyd-Max bound)
-- **23.03 MB** saved in shadow cache
-- **0 errors** across entire benchmark session
+- **49.59 MB** saved in shadow cache
+- **0 errors** across entire benchmark session (20+ concurrent users)
 
 ## Mathematical Foundation
 
