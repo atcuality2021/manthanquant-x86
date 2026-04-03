@@ -284,6 +284,18 @@ class TurboQuantDecoder:
         return reconstructed
 
 
+# ── CUDA kernel backend (Phase 2) ────────────────────────────────────────
+
+_C = None
+HAS_CUDA_KERNELS = False
+
+try:
+    import manthanquant._C as _C
+    HAS_CUDA_KERNELS = True
+except ImportError:
+    pass
+
+
 # ── Convenience functions ────────────────────────────────────────────────
 
 
@@ -296,6 +308,8 @@ def encode(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Encode vectors using 3-bit Lloyd-Max quantization.
 
+    Auto-selects CUDA kernels (if built) or PyTorch fallback.
+
     Args:
         vectors: [N, D] tensor on any device
         bits: quantization bits (2, 3, or 4)
@@ -303,6 +317,10 @@ def encode(
     Returns:
         (radii, packed) — both on same device as input
     """
+    # Use CUDA kernels if available and input is on GPU
+    if HAS_CUDA_KERNELS and vectors.is_cuda:
+        return _C.tq_encode(vectors.float().contiguous(), 42, bits)
+
     if bits == 3:
         return _default_encoder.encode(vectors)
     return TurboQuantEncoder(bits).encode(vectors)
@@ -313,6 +331,8 @@ def decode(
 ) -> torch.Tensor:
     """Decode compressed vectors.
 
+    Auto-selects CUDA kernels (if built) or PyTorch fallback.
+
     Args:
         radii: [N] float32 norms
         packed: [N, words] int32 bit-packed indices
@@ -322,6 +342,9 @@ def decode(
     Returns:
         [N, D] float32 reconstructed vectors
     """
+    if HAS_CUDA_KERNELS and radii.is_cuda:
+        return _C.tq_decode(radii, packed, D, 42, bits)
+
     if bits == 3:
         return _default_decoder.decode(radii, packed, D)
     return TurboQuantDecoder(bits).decode(radii, packed, D)
