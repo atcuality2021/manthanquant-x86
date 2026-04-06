@@ -100,42 +100,95 @@ def _deferred_patch():
         ops.reshape_and_cache_flash = _patched
         print(f"===== ManthanQuant TurboQuant ACTIVE (pid={{os.getpid()}}) =====", flush=True)
 
-        # V1 fix: fa_utils caches reshape_and_cache_flash at import time.
-        # Patch it immediately if already loaded, otherwise wait in a thread.
-        _v1_modules = [
+        # V1 fix: patch cached function references in all attention backends.
+        # Flash Attention backends cache reshape_and_cache_flash at import.
+        # Triton Attention uses triton_reshape_and_cache_flash instead.
+        _v1_flash_modules = [
             "vllm.v1.attention.backends.fa_utils",
             "vllm.v1.attention.backends.flash_attn",
         ]
+        _v1_triton_modules = [
+            ("vllm.v1.attention.ops.triton_reshape_and_cache_flash",
+             "triton_reshape_and_cache_flash"),
+            ("vllm.v1.attention.backends.triton_attn",
+             "triton_reshape_and_cache_flash"),
+        ]
 
-        def _patch_v1_ref(mod_name):
+        def _make_triton_wrapper(original_fn):
+            """Wrap triton_reshape_and_cache_flash with compression hook."""
+            def _triton_patched(key, value, key_cache, value_cache,
+                               slot_mapping, kv_cache_dtype, k_scale, v_scale):
+                original_fn(key, value, key_cache, value_cache,
+                           slot_mapping, kv_cache_dtype, k_scale, v_scale)
+                try:
+                    _stats["calls"] += 1
+                    valid = slot_mapping[slot_mapping >= 0]
+                    if valid.numel() > 0 and key_cache.ndim >= 3:
+                        # Triton uses [num_blocks, block_size, num_heads, head_size]
+                        bs = key_cache.shape[1]
+                        bids = (valid // bs).unique()
+                        for bid_t in bids:
+                            bid = bid_t.item()
+                            if not _cache.is_compressed(bid) and bid < key_cache.shape[0]:
+                                kb = key_cache[bid]
+                                vb = value_cache[bid]
+                                if kb.ndim == 3:
+                                    _cache.compress_block(
+                                        block_id=bid, key_cache=kb, value_cache=vb,
+                                        block_size=kb.shape[0], num_kv_heads=kb.shape[1],
+                                        head_dim=kb.shape[2],
+                                    )
+                    if _stats["calls"] % 200 == 0:
+                        s = _cache.get_stats()
+                        print(f"[ManthanQuant pid={{os.getpid()}}] calls={{_stats['calls']}} "
+                              f"compressed={{s['compressions']}} "
+                              f"ratio={{s['compression_ratio']}}x "
+                              f"saved={{s['memory_saved_mb']}}MB", flush=True)
+                except Exception as e:
+                    _stats["errors"] += 1
+                    if _stats["errors"] <= 3:
+                        print(f"[ManthanQuant] error: {{e}}", flush=True)
+            return _triton_patched
+
+        def _patch_v1_ref(mod_name, attr="reshape_and_cache_flash", wrapper=None):
             if mod_name in sys.modules:
                 m = sys.modules[mod_name]
-                if hasattr(m, "reshape_and_cache_flash"):
-                    m.reshape_and_cache_flash = _patched
-                    print(f"[ManthanQuant] {{mod_name}} patched (pid={{os.getpid()}})", flush=True)
+                if hasattr(m, attr):
+                    if wrapper is None:
+                        setattr(m, attr, _patched)
+                    else:
+                        # Create wrapper around the original triton function
+                        orig = getattr(m, attr)
+                        setattr(m, attr, wrapper(orig))
+                    print(f"[ManthanQuant] {{mod_name}}.{{attr}} patched (pid={{os.getpid()}})", flush=True)
                     return True
             return False
 
         # Immediate patch for already-loaded modules
-        _all_patched = all(_patch_v1_ref(mn) for mn in _v1_modules if mn in sys.modules)
+        for mn in _v1_flash_modules:
+            _patch_v1_ref(mn)
+        for mn, attr in _v1_triton_modules:
+            _patch_v1_ref(mn, attr=attr, wrapper=_make_triton_wrapper)
 
         # Deferred patch for modules not yet loaded
-        if not _all_patched:
-            def _patch_v1_deferred():
-                import time as _t2
-                for _ in range(300):  # Wait up to 30 seconds
-                    all_done = True
-                    for mn in _v1_modules:
-                        if mn in sys.modules:
-                            _patch_v1_ref(mn)
-                        elif mn.split(".")[-1] in ("fa_utils",):
-                            all_done = False  # Only wait for fa_utils
-                    if all_done:
-                        break
-                    _t2.sleep(0.1)
+        def _patch_v1_deferred():
+            import time as _t2
+            _patched_set = set()
+            all_targets = (
+                [(mn, "reshape_and_cache_flash", None) for mn in _v1_flash_modules]
+                + [(mn, attr, _make_triton_wrapper) for mn, attr in _v1_triton_modules]
+            )
+            for _ in range(300):  # Wait up to 30 seconds
+                for mn, attr, wrapper in all_targets:
+                    if mn not in _patched_set and mn in sys.modules:
+                        _patch_v1_ref(mn, attr=attr, wrapper=wrapper)
+                        _patched_set.add(mn)
+                if len(_patched_set) == len(all_targets):
+                    break
+                _t2.sleep(0.1)
 
-            import threading as _th2
-            _th2.Thread(target=_patch_v1_deferred, daemon=True).start()
+        import threading as _th2
+        _th2.Thread(target=_patch_v1_deferred, daemon=True).start()
     except Exception as e:
         print(f"ManthanQuant patch failed: {{e}}", flush=True)
 
