@@ -99,6 +99,43 @@ def _deferred_patch():
 
         ops.reshape_and_cache_flash = _patched
         print(f"===== ManthanQuant TurboQuant ACTIVE (pid={{os.getpid()}}) =====", flush=True)
+
+        # V1 fix: fa_utils caches reshape_and_cache_flash at import time.
+        # Patch it immediately if already loaded, otherwise wait in a thread.
+        _v1_modules = [
+            "vllm.v1.attention.backends.fa_utils",
+            "vllm.v1.attention.backends.flash_attn",
+        ]
+
+        def _patch_v1_ref(mod_name):
+            if mod_name in sys.modules:
+                m = sys.modules[mod_name]
+                if hasattr(m, "reshape_and_cache_flash"):
+                    m.reshape_and_cache_flash = _patched
+                    print(f"[ManthanQuant] {{mod_name}} patched (pid={{os.getpid()}})", flush=True)
+                    return True
+            return False
+
+        # Immediate patch for already-loaded modules
+        _all_patched = all(_patch_v1_ref(mn) for mn in _v1_modules if mn in sys.modules)
+
+        # Deferred patch for modules not yet loaded
+        if not _all_patched:
+            def _patch_v1_deferred():
+                import time as _t2
+                for _ in range(300):  # Wait up to 30 seconds
+                    all_done = True
+                    for mn in _v1_modules:
+                        if mn in sys.modules:
+                            _patch_v1_ref(mn)
+                        elif mn.split(".")[-1] in ("fa_utils",):
+                            all_done = False  # Only wait for fa_utils
+                    if all_done:
+                        break
+                    _t2.sleep(0.1)
+
+            import threading as _th2
+            _th2.Thread(target=_patch_v1_deferred, daemon=True).start()
     except Exception as e:
         print(f"ManthanQuant patch failed: {{e}}", flush=True)
 
